@@ -6,6 +6,8 @@
   "workers": 100,
   "quota_workers": 100,
   "delete_workers": 20,
+  "close_workers": 20,
+  "enable_workers": 20,
   "timeout": 10,
   "retries": 1,
   "user_agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
@@ -22,5 +24,7 @@
   "auto_allow_scan_closed": false,
   "standby_output": "standby_accounts.json",
   "weekly_quota_threshold": 99,
-  "primary_quota_threshold": 99
+  "primary_quota_threshold": 99,
+  "web_login_username": "",
+  "web_login_password": ""
 }

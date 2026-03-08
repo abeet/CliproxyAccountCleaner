@@ -9,6 +9,7 @@ Enhanced UI:
 
 import os
 import sys
+import argparse
 import json
 import asyncio
 import threading
@@ -16,12 +17,19 @@ import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, messagebox
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+except Exception:
+    tk = None
+    ttk = None
+    messagebox = None
 import requests
 import aiohttp
 
 HERE = os.path.abspath(os.path.dirname(__file__))
+_TK_BASE = tk.Tk if tk is not None else object
 
 
 def pick_existing_in(base_dir, *names):
@@ -96,8 +104,11 @@ def _contains_limit_error(value):
 def load_config(path):
     if not os.path.exists(path):
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"config.json 格式错误: {e}")
     if not isinstance(data, dict):
         raise RuntimeError("config.json 顶层必须是对象")
     return data
@@ -221,6 +232,35 @@ def build_quota_payload(auth_index, user_agent, chatgpt_account_id=None):
     return build_usage_payload(auth_index, user_agent, chatgpt_account_id)
 
 
+async def _run_bounded(items, limit, make_coro):
+    """Run async jobs with bounded in-flight tasks.
+    Avoid creating one task per item when item count is huge.
+    """
+    limit = max(1, int(limit or 1))
+    it = iter(items or [])
+    running = set()
+    out = []
+
+    for _ in range(limit):
+        try:
+            item = next(it)
+        except StopIteration:
+            break
+        running.add(asyncio.create_task(make_coro(item)))
+
+    while running:
+        done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            out.append(await task)
+            try:
+                item = next(it)
+            except StopIteration:
+                continue
+            running.add(asyncio.create_task(make_coro(item)))
+
+    return out
+
+
 async def probe_accounts(
     base_url,
     token,
@@ -315,11 +355,12 @@ async def probe_accounts(
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(probe_one(session, sem, item)) for item in refreshed_candidates]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            refreshed_candidates,
+            max(1, workers),
+            lambda item: probe_one(session, sem, item),
+        )
     return out
 
 
@@ -642,11 +683,12 @@ async def check_quota_accounts(
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(quota_one(session, sem, item)) for item in refreshed_candidates]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            refreshed_candidates,
+            max(1, workers),
+            lambda item: quota_one(session, sem, item),
+        )
     return out
 
 
@@ -690,11 +732,12 @@ async def set_disabled_names(base_url, token, names, disabled, workers, timeout)
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(set_one(session, sem, n)) for n in names]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            names,
+            max(1, workers),
+            lambda n: set_one(session, sem, n),
+        )
     return out
 
 
@@ -724,16 +767,19 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, delete_workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(delete_one(session, sem, n)) for n in names]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            names,
+            max(1, delete_workers),
+            lambda n: delete_one(session, sem, n),
+        )
     return out
 
 
-class EnhancedUI(tk.Tk):
+class EnhancedUI(_TK_BASE):
     def __init__(self, conf, config_path):
+        if tk is None:
+            raise RuntimeError("当前环境缺少 tkinter，无法启动桌面模式。")
         super().__init__()
         self.title("CliproxyAccountCleaner v1.3.3")
         self.geometry("1220x760")
@@ -4514,9 +4560,23 @@ class EnhancedUI(tk.Tk):
 
 
 def main():
-    conf = load_config(CONFIG_PATH)
-    app = EnhancedUI(conf, CONFIG_PATH)
-    app.mainloop()
+    parser = argparse.ArgumentParser(description="CliproxyAccountCleaner")
+    parser.add_argument("--desktop", action="store_true", help="使用桌面模式(Tkinter)")
+    parser.add_argument("--host", default="127.0.0.1", help="网页模式监听地址")
+    parser.add_argument("--port", type=int, default=8765, help="网页模式端口")
+    parser.add_argument("--no-browser", action="store_true", help="网页模式启动时不自动打开浏览器")
+    args = parser.parse_args()
+
+    if args.desktop:
+        if tk is None:
+            raise RuntimeError("当前环境缺少 tkinter，无法启动桌面模式。请改用网页模式或安装 Tk 运行时。")
+        conf = load_config(CONFIG_PATH)
+        app = EnhancedUI(conf, CONFIG_PATH)
+        app.mainloop()
+        return
+
+    from cliproxy_web_mode import run_web_mode
+    run_web_mode(host=args.host, port=args.port, no_browser=args.no_browser, ns=globals())
 
 
 if __name__ == "__main__":
